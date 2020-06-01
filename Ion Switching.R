@@ -4,10 +4,9 @@
 #open channels are generally banded by signal
 #signal vs open channel seems to follow the same distribution within an experiment
 #mean signal value of a channel isn't very consistent across experiments
-#sd signal value of a channel is pretty consistent within experiments
+#signal range per channel same within an experiment
 #channels open and close rapidly and repeatedly
 #signal is pA
-#current change should be the same per channel per experiment
 
 #In terms of relative performance, note that whilst there was a strong correlation
 #between open probabilities measured between Deep-Channel and threshold crossing, 
@@ -26,25 +25,23 @@
 
 
 ###Things to Do###
-#Read paper to learn about data set generation
-#look at Kaggle notebooks for ideas
 #refactor cleaning function
 #Fix legend icon size on summary graph
-#Get RStudio EC2 working for training
 
 ###Possible modes of attack
-#fit a big, general glm for each experiment, use sd to define number of levels, shift
-# multiclass logistic regression if we know the levels
-#neural net?
+#simple regression prediction subtracted to flatten, signal range to estimate channel number, divide
+#mash a neural net on it
+#FT for signals
 
-#library(randomForest)
-#library(rpart)
-#library(data.table)
 library(ggplot2)
 library(caret)
 library(tidyverse)
 library(RColorBrewer)
+library(tensorflow)
+library(keras)
 
+install_tensorflow()
+install_keras()
 #Functions------------------------------
 
 #loss function
@@ -55,10 +52,17 @@ macro_f1<-function(predicted,actual){
 
 #data prep function
 clean_data<-function(data){
-  data%>%mutate(
+  new_columns<-data%>%mutate(
     batch=floor((train_data$time-.0001)/50)+1, 
     adjustedtime=train_data$time-((batch-1)*50))
+  
+  averages<-new_columns%>%
+    group_by(batch)%>%
+    summarize(signal_mean=mean(signal))
+  
+  new_columns%>%left_join(averages,by= "batch")
 }
+
 
 train_data<-read.csv("train.csv")
 test_data<-read.csv("test.csv")
@@ -139,6 +143,16 @@ signal_channel_summary<-clean_train_data%>%
             "Signal Standard Deviation"=sd(signal))%>%
   arrange(open_channels)
 
+#Signal Sd vs Open Channel Range per Batch (perhaps refactor with signal range minus outliers)
+sdchandata<-clean_train_data%>%
+  group_by(batch)%>%
+  summarize(sd=sd(signal),
+            channel_range=max(open_channels)-min(open_channels))
+
+spread_graph<-ggplot(sdchandata,aes(x=channel_range,y=sd,label=as.factor(batch)))+
+  geom_point()+
+  geom_text(position="jitter")
+  
 #signal vs time with channel color
 summary_graphs<-ggplot(clean_train_data, aes(x=adjustedtime,y=signal, color=as.factor(open_channels)))+
     geom_point(shape=".")+
@@ -188,6 +202,124 @@ random_guess<-sample(0:10, 5000000, replace=TRUE)
 random_f1<-macro_f1(random_guess,train_data$open_channels)
 random_f1 #.0779
 
-#multiclass logistic regression
-#knn for smoothing?
-#what kinds of neural nets can i do here?
+
+#try stepwise linear and quadratic models (this could be more generalized)
+#subtract regression prediction from model to flatten
+#use range signal vs range open channels to find number of channels (clean up with NoiseFiltersR?)
+#divide starting from zero at the bottom, channels are equal sig range
+#figure out if zero should be lowest or no
+
+#I had to hardcode the predict line, I couldn't find the logic flaw in start and stop time
+piecewise<-function(signal_data,chunk_seconds){
+  
+  chunks<-round(max(signal_data$adjustedtime)/chunk_seconds)
+  interval<-signal_data$adjustedtime[2]-signal_data$adjustedtime[1]
+  
+  fits<-sapply(1:chunks,function(c){
+    start_t<-((c-1)*chunk_seconds)+interval
+    end_t<-(c*chunk_seconds)
+    data<-filter(signal_data,between(adjustedtime,start_t,end_t))
+    
+    fit<-lm(signal~adjustedtime, data=data)
+    predict(fit, newdata=data.frame(adjustedtime=seq(((c-1)*10+.0001),(c*10),.0001)))
+  })
+  
+  unlist(fits)
+}
+
+flattener<- function(signal_data){
+  #a vector of batch numbers for the experiments
+  batch_range<-min(signal_data$batch):max(signal_data$batch)
+  
+  #a linear step function fitting the 50s experiments in 5 chunks
+  piecewise_functions<-sapply(batch_range,function(y){
+    piecewise(filter(signal_data,batch==y),10)
+  })
+    
+  #the RMSE of each piecewise function fit
+  piecewise_functions_errs<-sapply(batch_range,function(z){
+    data<-filter(signal_data,batch==z)
+    RMSE(piecewise_functions[[z]],data$signal)
+    })
+  
+  #a quadratic function for each experiment
+  quadratic_functions<-sapply(batch_range,function(y){
+    fit<-lm(signal~poly(adjustedtime,2), data=filter(signal_data,batch==y))
+    as.numeric(unlist(fit[5]))
+    })
+  
+  #the RMSE for each quadratic function fit
+  quadratic_functions_errs<-sapply(batch_range,function(z){
+    data<-filter(signal_data,batch==z)
+    RMSE(quadratic_functions[,z],data$signal)
+    })
+  
+  #selecting which of the two fits was the best for each experiment
+  predictions<-sapply(batch_range,function(z){
+    if(piecewise_functions_errs[z]<quadratic_functions_errs[z]){
+      piecewise_functions[[z]]
+    }
+    else{
+      quadratic_functions[,z]
+    }
+  })
+  
+  #putting the predictions together as a single vector
+  fits<-as.vector(as.matrix(predictions[c(1:length(predictions))]))
+  
+  #subtracting the predictions from the actual signal to flatten the graphs
+  flatvalues<-signal_data$signal-fits
+  
+  #adding these flattened predictions
+  mutate(signal_data,flatvalues=flatvalues)
+}
+
+#using the above function on train data
+flattened_signal<-flattener(clean_train_data)
+
+#filtering out extreme outlier signal data
+filtered_flat<-flattened_signal%>%
+  group_by(batch)%>%
+  filter(abs(flatvalues)<(mean(flatvalues)+(7*sd(flatvalues))))
+
+#this will eventually be turned in to a linear equation that can be used with the flatten and filter output of test data
+sdchandata2<-filtered_flat%>%
+  group_by(batch)%>%
+  summarize(sig_range=max(flatvalues)-min(flatvalues),
+            channel_range=max(open_channels)-min(open_channels))
+
+spread_graph2<-ggplot(sdchandata2,aes(x=sig_range,y=channel_range,label=as.factor(batch)))+
+  geom_point()+
+  geom_text(position="jitter")
+
+spread_graph2
+
+#neural net, man
+x_train<-select(clean_train_data,c(adjustedtime,signal,signal_mean))
+x_train$adjustedtime=x_train$adjustedtime/50
+x_train$signal=(x_train$signal-min(x_train$signal))/(max(x_train$signal-min(x_train$signal)))
+x_train$signal_mean=(x_train$signal_mean-min(x_train$signal_mean))/(max(x_train$signal_mean-min(x_train$signal_mean)))
+x_train=data.matrix(x_train)
+
+y_train<-as.factor(clean_train_data$open_channels)
+y_train<-to_categorical(y_train,11)
+
+model <- keras_model_sequential()%>% 
+  # Adds a densely-connected layer with 64 units to the model:
+  layer_dense(units = 64, activation = 'relu') %>%
+  
+  # Add another:
+  layer_dense(units = 64, activation = 'relu') %>%
+  
+  # Add a softmax layer with 10 output units:
+  layer_dense(units = 10, activation = 'softmax')
+
+#random forest, final model
+controlrf <- trainControl(method = "oob",
+                          number= 10,
+                          p=0.75)
+mtry<-data.frame(mtry=1:10)
+train_rf <- train(y_train ~ x_train, method="rf",
+              data = prep,
+              tuneGrid=mtry,
+              trControl = controlrf)
